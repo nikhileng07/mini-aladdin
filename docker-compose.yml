@@ -1,0 +1,206 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'your-fernet-key-here'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_DEFAULT_REGION: us-east-1
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+  volumes:
+    - ./orchestration/dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./processing:/opt/airflow/processing
+    - ./analytics:/opt/airflow/analytics
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: mini_aladdin_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: mini_aladdin_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: mini_aladdin_kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+    ports:
+      - "29092:29092"
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: mini_aladdin_kafka_ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: mini-aladdin
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8080:8080"
+    restart: always
+
+  minio:
+    image: minio/minio:latest
+    container_name: mini_aladdin_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: mini_aladdin_spark_master
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    command: /opt/spark/sbin/start-master.sh
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+    volumes:
+      - ./processing:/opt/spark/jobs
+      - ./data:/opt/spark/data
+    restart: always
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: mini_aladdin_spark_worker
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    depends_on:
+      - spark-master
+    volumes:
+      - ./processing:/opt/spark/jobs
+      - ./data:/opt/spark/data
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: mini_aladdin_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@minialaddin.com \
+          --password admin
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: mini_aladdin_airflow_webserver
+    command: webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mini_aladdin_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  dashboard:
+    image: python:3.11-slim
+    container_name: mini_aladdin_dashboard
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./dashboard:/app
+      - ./analytics:/app/analytics
+      - ./data:/app/data
+      - ./processing:/app/processing
+      - ./config:/app/config
+    command: >
+      bash -c "pip install dash plotly dash-bootstrap-components pandas numpy duckdb yfinance scipy pydantic pydantic-settings loguru &&
+               python app.py"
+    ports:
+      - "8050:8050"
+    restart: always
+
+volumes:
+  postgres_data:
+  minio_data:
